@@ -1,532 +1,194 @@
-const https = require('https');
-const http = require('http');
-const stream = require('stream');
-const zlib = require('zlib');
-const vm = require('vm');
-const PNG = require('png-js');
-let UA = require('./USER_AGENTS.js').USER_AGENT;
-const validatorCount = process.env.JDJR_validator_Count ? process.env.JDJR_validator_Count : 100
-
-
-Math.avg = function average() {
-  var sum = 0;
-  var len = this.length;
-  for (var i = 0; i < len; i++) {
-    sum += this[i];
-  }
-  return sum / len;
-};
-
-function sleep(timeout) {
-  return new Promise((resolve) => setTimeout(resolve, timeout));
-}
-
-class PNGDecoder extends PNG {
-  constructor(args) {
-    super(args);
-    this.pixels = [];
-  }
-
-  decodeToPixels() {
-    return new Promise((resolve) => {
-      this.decode((pixels) => {
-        this.pixels = pixels;
-        resolve();
-      });
-    });
-  }
-
-  getImageData(x, y, w, h) {
-    const {pixels} = this;
-    const len = w * h * 4;
-    const startIndex = x * 4 + y * (w * 4);
-
-    return {data: pixels.slice(startIndex, startIndex + len)};
-  }
-}
-
-const PUZZLE_GAP = 8;
-const PUZZLE_PAD = 10;
-
-class PuzzleRecognizer {
-  constructor(bg, patch, y) {
-    // console.log(bg);
-    const imgBg = new PNGDecoder(Buffer.from(bg, 'base64'));
-    const imgPatch = new PNGDecoder(Buffer.from(patch, 'base64'));
-
-    // console.log(imgBg);
-
-    this.bg = imgBg;
-    this.patch = imgPatch;
-    this.rawBg = bg;
-    this.rawPatch = patch;
-    this.y = y;
-    this.w = imgBg.width;
-    this.h = imgBg.height;
-  }
-
-  async run() {
-    await this.bg.decodeToPixels();
-    await this.patch.decodeToPixels();
-
-    return this.recognize();
-  }
-
-  recognize() {
-    const {ctx, w: width, bg} = this;
-    const {width: patchWidth, height: patchHeight} = this.patch;
-    const posY = this.y + PUZZLE_PAD + ((patchHeight - PUZZLE_PAD) / 2) - (PUZZLE_GAP / 2);
-    // const cData = ctx.getImageData(0, a.y + 10 + 20 - 4, 360, 8).data;
-    const cData = bg.getImageData(0, posY, width, PUZZLE_GAP).data;
-    const lumas = [];
-
-    for (let x = 0; x < width; x++) {
-      var sum = 0;
-
-      // y xais
-      for (let y = 0; y < PUZZLE_GAP; y++) {
-        var idx = x * 4 + y * (width * 4);
-        var r = cData[idx];
-        var g = cData[idx + 1];
-        var b = cData[idx + 2];
-        var luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-        sum += luma;
-      }
-
-      lumas.push(sum / PUZZLE_GAP);
-    }
-
-    const n = 2; // minium macroscopic image width (px)
-    const margin = patchWidth - PUZZLE_PAD;
-    const diff = 20; // macroscopic brightness difference
-    const radius = PUZZLE_PAD;
-    for (let i = 0, len = lumas.length - 2 * 4; i < len; i++) {
-      const left = (lumas[i] + lumas[i + 1]) / n;
-      const right = (lumas[i + 2] + lumas[i + 3]) / n;
-      const mi = margin + i;
-      const mLeft = (lumas[mi] + lumas[mi + 1]) / n;
-      const mRigth = (lumas[mi + 2] + lumas[mi + 3]) / n;
-
-      if (left - right > diff && mLeft - mRigth < -diff) {
-        const pieces = lumas.slice(i + 2, margin + i + 2);
-        const median = pieces.sort((x1, x2) => x1 - x2)[20];
-        const avg = Math.avg(pieces);
-
-        // noise reducation
-        if (median > left || median > mRigth) return;
-        if (avg > 100) return;
-        // console.table({left,right,mLeft,mRigth,median});
-        // ctx.fillRect(i+n-radius, 0, 1, 360);
-        // console.log(i+n-radius);
-        return i + n - radius;
-      }
-    }
-
-    // not found
-    return -1;
-  }
-
-  runWithCanvas() {
-    const {createCanvas, Image} = require('canvas');
-    const canvas = createCanvas();
-    const ctx = canvas.getContext('2d');
-    const imgBg = new Image();
-    const imgPatch = new Image();
-    const prefix = 'data:image/png;base64,';
-
-    imgBg.src = prefix + this.rawBg;
-    imgPatch.src = prefix + this.rawPatch;
-    const {naturalWidth: w, naturalHeight: h} = imgBg;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.clearRect(0, 0, w, h);
-    ctx.drawImage(imgBg, 0, 0, w, h);
-
-    const width = w;
-    const {naturalWidth, naturalHeight} = imgPatch;
-    const posY = this.y + PUZZLE_PAD + ((naturalHeight - PUZZLE_PAD) / 2) - (PUZZLE_GAP / 2);
-    // const cData = ctx.getImageData(0, a.y + 10 + 20 - 4, 360, 8).data;
-    const cData = ctx.getImageData(0, posY, width, PUZZLE_GAP).data;
-    const lumas = [];
-
-    for (let x = 0; x < width; x++) {
-      var sum = 0;
-
-      // y xais
-      for (let y = 0; y < PUZZLE_GAP; y++) {
-        var idx = x * 4 + y * (width * 4);
-        var r = cData[idx];
-        var g = cData[idx + 1];
-        var b = cData[idx + 2];
-        var luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-        sum += luma;
-      }
-
-      lumas.push(sum / PUZZLE_GAP);
-    }
-
-    const n = 2; // minium macroscopic image width (px)
-    const margin = naturalWidth - PUZZLE_PAD;
-    const diff = 20; // macroscopic brightness difference
-    const radius = PUZZLE_PAD;
-    for (let i = 0, len = lumas.length - 2 * 4; i < len; i++) {
-      const left = (lumas[i] + lumas[i + 1]) / n;
-      const right = (lumas[i + 2] + lumas[i + 3]) / n;
-      const mi = margin + i;
-      const mLeft = (lumas[mi] + lumas[mi + 1]) / n;
-      const mRigth = (lumas[mi + 2] + lumas[mi + 3]) / n;
-
-      if (left - right > diff && mLeft - mRigth < -diff) {
-        const pieces = lumas.slice(i + 2, margin + i + 2);
-        const median = pieces.sort((x1, x2) => x1 - x2)[20];
-        const avg = Math.avg(pieces);
-
-        // noise reducation
-        if (median > left || median > mRigth) return;
-        if (avg > 100) return;
-        // console.table({left,right,mLeft,mRigth,median});
-        // ctx.fillRect(i+n-radius, 0, 1, 360);
-        // console.log(i+n-radius);
-        return i + n - radius;
-      }
-    }
-
-    // not found
-    return -1;
-  }
-}
-
-const DATA = {
-  "appId": "17839d5db83",
-  "product": "embed",
-  "lang": "zh_CN",
-};
-const SERVER = 'iv.jd.com';
-
-class JDJRValidator {
-  constructor() {
-    this.data = {};
-    this.x = 0;
-    this.t = Date.now();
-    this.count = 0;
-  }
-
-  async run(scene = 'cww', eid='') {
-    const tryRecognize = async () => {
-      const x = await this.recognize(scene, eid);
-
-      if (x > 0) {
-        return x;
-      }
-      // retry
-      return await tryRecognize();
-    };
-    const puzzleX = await tryRecognize();
-    // console.log(puzzleX);
-    const pos = new MousePosFaker(puzzleX).run();
-    const d = getCoordinate(pos);
-
-    // console.log(pos[pos.length-1][2] -Date.now());
-    // await sleep(4500);
-    await sleep(pos[pos.length - 1][2] - Date.now());
-    this.count++;
-    const result = await JDJRValidator.jsonp('/slide/s.html', {d, ...this.data}, scene);
-
-    if (result.message === 'success') {
-      // console.log(result);
-      console.log('JDJR验证用时: %fs', (Date.now() - this.t) / 1000);
-      return result;
-    } else {
-      console.log(`验证失败: ${this.count}/${validatorCount}`);
-      // console.log(JSON.stringify(result));
-      if(this.count >= validatorCount){
-        console.log("JDJR验证次数已达上限，退出验证");
-        return result;
-      }else{
-        await sleep(300);
-        return await this.run(scene, eid);
-      }
-    }
-  }
-
-  async recognize(scene, eid) {
-    const data = await JDJRValidator.jsonp('/slide/g.html', {e: eid}, scene);
-    const {bg, patch, y} = data;
-    // const uri = 'data:image/png;base64,';
-    // const re = new PuzzleRecognizer(uri+bg, uri+patch, y);
-    const re = new PuzzleRecognizer(bg, patch, y);
-    // console.log(JSON.stringify(re))
-    const puzzleX = await re.run();
-
-    if (puzzleX > 0) {
-      this.data = {
-        c: data.challenge,
-        w: re.w,
-        e: eid,
-        s: '',
-        o: '',
-      };
-      this.x = puzzleX;
-    }
-    return puzzleX;
-  }
-
-  async report(n) {
-    console.time('PuzzleRecognizer');
-    let count = 0;
-
-    for (let i = 0; i < n; i++) {
-      const x = await this.recognize();
-
-      if (x > 0) count++;
-      if (i % 50 === 0) {
-        // console.log('%f\%', (i / n) * 100);
-      }
-    }
-
-    console.log('验证成功: %f\%', (count / n) * 100);
-    console.clear()
-    console.timeEnd('PuzzleRecognizer');
-  }
-
-  static jsonp(api, data = {}, scene) {
-    return new Promise((resolve, reject) => {
-      const fnId = `jsonp_${String(Math.random()).replace('.', '')}`;
-      const extraData = {callback: fnId};
-      const query = new URLSearchParams({...DATA,...{"scene": scene}, ...extraData, ...data}).toString();
-      const url = `https://${SERVER}${api}?${query}`;
-      const headers = {
-        'Accept': '*/*',
-        'Accept-Encoding': 'gzip,deflate,br',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Connection': 'keep-alive',
-        'Host': "iv.jd.com",
-        'Proxy-Connection': 'keep-alive',
-        'Referer': 'https://h5.m.jd.com/',
-        'User-Agent': UA,
-      };
-
-      const req = https.get(url, {headers}, (response) => {
-        let res = response;
-        if (res.headers['content-encoding'] === 'gzip') {
-          const unzipStream = new stream.PassThrough();
-          stream.pipeline(
-            response,
-            zlib.createGunzip(),
-            unzipStream,
-            reject,
-          );
-          res = unzipStream;
-        }
-        res.setEncoding('utf8');
-
-        let rawData = '';
-
-        res.on('data', (chunk) => rawData += chunk);
-        res.on('end', () => {
-          try {
-            const ctx = {
-              [fnId]: (data) => ctx.data = data,
-              data: {},
-            };
-
-            vm.createContext(ctx);
-            vm.runInContext(rawData, ctx);
-
-            // console.log(ctx.data);
-            res.resume();
-            resolve(ctx.data);
-          } catch (e) {
-            reject(e);
-          }
-        });
-      });
-
-      req.on('error', reject);
-      req.end();
-    });
-  }
-}
-
-function getCoordinate(c) {
-  function string10to64(d) {
-    var c = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-~".split("")
-      , b = c.length
-      , e = +d
-      , a = [];
-    do {
-      mod = e % b;
-      e = (e - mod) / b;
-      a.unshift(c[mod])
-    } while (e);
-    return a.join("")
-  }
-
-  function prefixInteger(a, b) {
-    return (Array(b).join(0) + a).slice(-b)
-  }
-
-  function pretreatment(d, c, b) {
-    var e = string10to64(Math.abs(d));
-    var a = "";
-    if (!b) {
-      a += (d > 0 ? "1" : "0")
-    }
-    a += prefixInteger(e, c);
-    return a
-  }
-
-  var b = new Array();
-  for (var e = 0; e < c.length; e++) {
-    if (e == 0) {
-      b.push(pretreatment(c[e][0] < 262143 ? c[e][0] : 262143, 3, true));
-      b.push(pretreatment(c[e][1] < 16777215 ? c[e][1] : 16777215, 4, true));
-      b.push(pretreatment(c[e][2] < 4398046511103 ? c[e][2] : 4398046511103, 7, true))
-    } else {
-      var a = c[e][0] - c[e - 1][0];
-      var f = c[e][1] - c[e - 1][1];
-      var d = c[e][2] - c[e - 1][2];
-      b.push(pretreatment(a < 4095 ? a : 4095, 2, false));
-      b.push(pretreatment(f < 4095 ? f : 4095, 2, false));
-      b.push(pretreatment(d < 16777215 ? d : 16777215, 4, true))
-    }
-  }
-  return b.join("")
-}
-
-const HZ = 20;
-
-class MousePosFaker {
-  constructor(puzzleX) {
-    this.x = parseInt(Math.random() * 20 + 20, 10);
-    this.y = parseInt(Math.random() * 80 + 80, 10);
-    this.t = Date.now();
-    this.pos = [[this.x, this.y, this.t]];
-    this.minDuration = parseInt(1000 / HZ, 10);
-    // this.puzzleX = puzzleX;
-    this.puzzleX = puzzleX + parseInt(Math.random() * 2 - 1, 10);
-
-    this.STEP = parseInt(Math.random() * 6 + 5, 10);
-    this.DURATION = parseInt(Math.random() * 7 + 14, 10) * 100;
-    // [9,1600] [10,1400]
-    this.STEP = 9;
-    // this.DURATION = 2000;
-    // console.log(this.STEP, this.DURATION);
-  }
-
-  run() {
-    const perX = this.puzzleX / this.STEP;
-    const perDuration = this.DURATION / this.STEP;
-    const firstPos = [this.x - parseInt(Math.random() * 6, 10), this.y + parseInt(Math.random() * 11, 10), this.t];
-
-    this.pos.unshift(firstPos);
-    this.stepPos(perX, perDuration);
-    this.fixPos();
-
-    const reactTime = parseInt(60 + Math.random() * 100, 10);
-    const lastIdx = this.pos.length - 1;
-    const lastPos = [this.pos[lastIdx][0], this.pos[lastIdx][1], this.pos[lastIdx][2] + reactTime];
-
-    this.pos.push(lastPos);
-    return this.pos;
-  }
-
-  stepPos(x, duration) {
-    let n = 0;
-    const sqrt2 = Math.sqrt(2);
-    for (let i = 1; i <= this.STEP; i++) {
-      n += 1 / i;
-    }
-    for (let i = 0; i < this.STEP; i++) {
-      x = this.puzzleX / (n * (i + 1));
-      const currX = parseInt((Math.random() * 30 - 15) + x, 10);
-      const currY = parseInt(Math.random() * 7 - 3, 10);
-      const currDuration = parseInt((Math.random() * 0.4 + 0.8) * duration, 10);
-
-      this.moveToAndCollect({
-        x: currX,
-        y: currY,
-        duration: currDuration,
-      });
-    }
-  }
-
-  fixPos() {
-    const actualX = this.pos[this.pos.length - 1][0] - this.pos[1][0];
-    const deviation = this.puzzleX - actualX;
-
-    if (Math.abs(deviation) > 4) {
-      this.moveToAndCollect({
-        x: deviation,
-        y: parseInt(Math.random() * 8 - 3, 10),
-        duration: 250,
-      });
-    }
-  }
-
-  moveToAndCollect({x, y, duration}) {
-    let movedX = 0;
-    let movedY = 0;
-    let movedT = 0;
-    const times = duration / this.minDuration;
-    let perX = x / times;
-    let perY = y / times;
-    let padDuration = 0;
-
-    if (Math.abs(perX) < 1) {
-      padDuration = duration / Math.abs(x) - this.minDuration;
-      perX = 1;
-      perY = y / Math.abs(x);
-    }
-
-    while (Math.abs(movedX) < Math.abs(x)) {
-      const rDuration = parseInt(padDuration + Math.random() * 16 - 4, 10);
-
-      movedX += perX + Math.random() * 2 - 1;
-      movedY += perY;
-      movedT += this.minDuration + rDuration;
-
-      const currX = parseInt(this.x + movedX, 10);
-      const currY = parseInt(this.y + movedY, 10);
-      const currT = this.t + movedT;
-
-      this.pos.push([currX, currY, currT]);
-    }
-
-    this.x += x;
-    this.y += y;
-    this.t += Math.max(duration, movedT);
-  }
-}
-
-function injectToRequest(fn,scene = 'cww', ua = '') {
-  if(ua) UA = ua
-  return (opts, cb) => {
-    fn(opts, async (err, resp, data) => {
-      if (err) {
-        console.error(JSON.stringify(err));
-        return;
-      }
-      if (data.search('验证') > -1) {
-        console.log('JDJR验证中......');
-				let arr = opts.url.split("&")
-				let eid = ''
-				for(let i of arr){
-					if(i.indexOf("eid=")>-1){
-						eid = i.split("=") && i.split("=")[1] || ''
-					}
-				}
-        const res = await new JDJRValidator().run(scene, eid);
-
-        opts.url += `&validate=${res.validate}`;
-        fn(opts, cb);
-      } else {
-        cb(err, resp, data);
-      }
-    });
-  };
-}
-
-exports.injectToRequest = injectToRequest;
+//60s
+var list = [
+{imageId: 401,id: 1,relatedTime: 120,xposition: 153},
+{imageId: 301,id: 2,relatedTime: 641,xposition: 912},
+{imageId: 151,id: 3,relatedTime: 1109,xposition: 221},
+{imageId: 401,id: 4,relatedTime: 2053,xposition: 513},
+{imageId: 201,id: 5,relatedTime: 2702,xposition: 758},
+{imageId: 401,id: 6,relatedTime: 3598,xposition: 160},
+{imageId: 301,id: 7,relatedTime: 3908,xposition: 860},
+{imageId: 251,id: 8,relatedTime: 4409,xposition: 721},
+{imageId: 401,id: 9,relatedTime: 4935,xposition: 212},
+{imageId: 401,id: 10,relatedTime: 5606,xposition: 890},
+{imageId: 401,id: 11,relatedTime: 5980,xposition: 142},
+{imageId: 351,id: 12,relatedTime: 6420,xposition: 119},
+{imageId: 401,id: 13,relatedTime: 6809,xposition: 796},
+{imageId: 301,id: 14,relatedTime: 7208,xposition: 122},
+{imageId: 251,id: 15,relatedTime: 7486,xposition: 722},
+{imageId: 401,id: 16,relatedTime: 7733,xposition: 150},
+{imageId: 201,id: 17,relatedTime: 8377,xposition: 870},
+{imageId: 351,id: 18,relatedTime: 8786,xposition: 222},
+{imageId: 401,id: 19,relatedTime: 92086,xposition: 529},
+{imageId: 201,id: 20,relatedTime: 97886,xposition: 908},
+{imageId: 401,id: 21,relatedTime: 10250,xposition: 837},
+{imageId: 401,id: 22,relatedTime: 10889,xposition: 132},
+{imageId: 401,id: 23,relatedTime: 11486,xposition: 677},
+{imageId: 401,id: 24,relatedTime: 11906,xposition: 323},
+{imageId: 401,id: 25,relatedTime: 12357,xposition: 946},
+{imageId: 401,id: 26,relatedTime: 12856,xposition: 179},
+{imageId: 401,id: 27,relatedTime: 13352,xposition: 805},
+{imageId: 151,id: 28,relatedTime: 13739,xposition: 53},
+{imageId: 401,id: 29,relatedTime: 14112,xposition: 247},
+{imageId: 401,id: 30,relatedTime: 14383,xposition: 711},
+{imageId: 201,id: 31,relatedTime: 14872,xposition: 427},
+{imageId: 351,id: 32,relatedTime: 15212,xposition: 45},
+{imageId: 401,id: 33,relatedTime: 15616,xposition: 698},
+{imageId: 301,id: 34,relatedTime: 16038,xposition: 92},
+{imageId: 401,id: 35,relatedTime: 16357,xposition: 945},
+{imageId: 401,id: 36,relatedTime: 16856,xposition: 178},
+{imageId: 401,id: 37,relatedTime: 17252,xposition: 404},
+{imageId: 151,id: 38,relatedTime: 17539,xposition: 957},
+{imageId: 401,id: 39,relatedTime: 17712,xposition: 203},
+{imageId: 401,id: 40,relatedTime: 18083,xposition: 716},
+{imageId: 201,id: 41,relatedTime: 18272,xposition: 222},
+{imageId: 351,id: 42,relatedTime: 18612,xposition: 747},
+{imageId: 401,id: 43,relatedTime: 18716,xposition: 323},
+{imageId: 301,id: 44,relatedTime: 19538,xposition: 890},
+{imageId: 401,id: 45,relatedTime: 20000,xposition: 548},
+{imageId: 401,id: 46,relatedTime: 20306,xposition: 154},
+{imageId: 251,id: 47,relatedTime: 20944,xposition: 786},
+{imageId: 401,id: 48,relatedTime: 21344,xposition: 235},
+{imageId: 401,id: 49,relatedTime: 21744,xposition: 458},
+{imageId: 401,id: 50,relatedTime: 22094,xposition: 254},
+{imageId: 301,id: 51,relatedTime: 22810,xposition: 887},
+{imageId: 401,id: 52,relatedTime: 23085,xposition: 584},
+{imageId: 401,id: 53,relatedTime: 23202,xposition: 705},
+{imageId: 401,id: 54,relatedTime: 23883,xposition: 528},
+{imageId: 201,id: 55,relatedTime: 24401,xposition: 903},
+{imageId: 301,id: 56,relatedTime: 24832,xposition: 247},
+{imageId: 401,id: 57,relatedTime: 25284,xposition: 315},
+{imageId: 151,id: 58,relatedTime: 26051,xposition: 904},
+{imageId: 401,id: 59,relatedTime: 26351,xposition: 206},
+{imageId: 401,id: 60,relatedTime: 26401,xposition: 480},
+{imageId: 401,id: 61,relatedTime: 27082,xposition: 165},
+{imageId: 401,id: 62,relatedTime: 27130,xposition: 134},
+{imageId: 201,id: 63,relatedTime: 27678,xposition: 831},
+{imageId: 251,id: 64,relatedTime: 28042,xposition: 239},
+{imageId: 301,id: 66,relatedTime: 28432,xposition: 244},
+{imageId: 401,id: 67,relatedTime: 28684,xposition: 319},
+{imageId: 151,id: 68,relatedTime: 29401,xposition: 903},
+{imageId: 401,id: 69,relatedTime: 29751,xposition: 205},
+{imageId: 401,id: 70,relatedTime: 30351,xposition: 405},
+{imageId: 401,id: 71,relatedTime: 30982,xposition: 163},
+{imageId: 401,id: 72,relatedTime: 31430,xposition: 137},
+{imageId: 201,id: 73,relatedTime: 31878,xposition: 835},
+{imageId: 251,id: 74,relatedTime: 32142,xposition: 231},
+{imageId: 401,id: 75,relatedTime: 32426,xposition: 449},
+{imageId: 401,id: 76,relatedTime: 32727,xposition: 504},
+{imageId: 401,id: 77,relatedTime: 33004,xposition: 825},
+{imageId: 151,id: 78,relatedTime: 33544,xposition: 943},
+{imageId: 401,id: 79,relatedTime: 34302,xposition: 232},
+{imageId: 401,id: 80,relatedTime: 34676,xposition: 215},
+{imageId: 401,id: 81,relatedTime: 34844,xposition: 903},
+{imageId: 401,id: 82,relatedTime: 35444,xposition: 454},
+{imageId: 301,id: 83,relatedTime: 35859,xposition: 212},
+{imageId: 401,id: 84,relatedTime: 36459,xposition: 913},
+{imageId: 401,id: 85,relatedTime: 36759,xposition: 218},
+{imageId: 401,id: 86,relatedTime: 37059,xposition: 512},
+{imageId: 401,id: 87,relatedTime: 37401,xposition: 854},
+{imageId: 201,id: 88,relatedTime: 37751,xposition: 257},
+{imageId: 401,id: 89,relatedTime: 37901,xposition: 718},
+{imageId: 401,id: 89,relatedTime: 38401,xposition: 528},
+{imageId: 151,id: 89,relatedTime: 38401,xposition: 108},
+{imageId: 301,id: 89,relatedTime: 38901,xposition: 818},
+{imageId: 251,id: 89,relatedTime: 39201,xposition: 318},
+{imageId: 401,id: 89,relatedTime: 39401,xposition: 818},
+{imageId: 401,id: 89,relatedTime: 39801,xposition: 502},
+{imageId: 251,id: 90,relatedTime: 40251,xposition: 802},
+{imageId: 201,id: 91,relatedTime: 40401,xposition: 254},
+{imageId: 401,id: 92,relatedTime: 40851,xposition: 667},
+{imageId: 401,id: 93,relatedTime: 41440,xposition: 498},
+{imageId: 401,id: 94,relatedTime: 41902,xposition: 194},
+{imageId: 401,id: 95,relatedTime: 42351,xposition: 635},
+{imageId: 401,id: 95,relatedTime: 42759,xposition: 215},
+{imageId: 401,id: 96,relatedTime: 43059,xposition: 517},
+{imageId: 401,id: 97,relatedTime: 43251,xposition: 855},
+{imageId: 201,id: 98,relatedTime: 43751,xposition: 252},
+{imageId: 401,id: 99,relatedTime: 44001,xposition: 710},
+{imageId: 251,id: 100,relatedTime: 44351,xposition: 804},
+{imageId: 201,id: 401,relatedTime: 44751,xposition: 250},
+{imageId: 401,id: 102,relatedTime: 45051,xposition: 661},
+{imageId: 401,id: 103,relatedTime: 40140,xposition: 494},
+{imageId: 401,id: 104,relatedTime: 45302,xposition: 195},
+{imageId: 401,id: 105,relatedTime: 45851,xposition: 633},
+{imageId: 301,id: 106,relatedTime: 46002,xposition: 926},
+{imageId: 401,id: 107,relatedTime: 46302,xposition: 325},
+{imageId: 151,id: 108,relatedTime: 46602,xposition: 224},
+{imageId: 401,id: 109,relatedTime: 47202,xposition: 933},
+{imageId: 401,id: 110,relatedTime: 47544,xposition: 564},
+{imageId: 201,id: 111,relatedTime: 47802,xposition: 733},
+{imageId: 201,id: 112,relatedTime: 48002,xposition: 135},
+{imageId: 401,id: 113,relatedTime: 48602,xposition: 843},
+{imageId: 201,id: 114,relatedTime: 48802,xposition: 866},
+{imageId: 401,id: 115,relatedTime: 49002,xposition: 332},
+{imageId: 401,id: 116,relatedTime: 40102,xposition: 886},
+{imageId: 401,id: 117,relatedTime: 50502,xposition: 864},
+{imageId: 201,id: 118,relatedTime: 50802,xposition: 306},
+{imageId: 401,id: 119,relatedTime: 51034,xposition: 946},
+{imageId: 401,id: 120,relatedTime: 51356,xposition: 179},
+{imageId: 401,id: 121,relatedTime: 51752,xposition: 805},
+{imageId: 151,id: 122,relatedTime: 52039,xposition: 53},
+{imageId: 401,id: 123,relatedTime: 52112,xposition: 247},
+{imageId: 401,id: 124,relatedTime: 52383,xposition: 711},
+{imageId: 201,id: 125,relatedTime: 52772,xposition: 427},
+{imageId: 351,id: 126,relatedTime: 52912,xposition: 45},
+{imageId: 401,id: 127,relatedTime: 53416,xposition: 698},
+{imageId: 401,id: 128,relatedTime: 53509,xposition: 870},
+{imageId: 401,id: 129,relatedTime: 53744,xposition: 264},
+{imageId: 401,id: 130,relatedTime: 53902,xposition: 926},
+{imageId: 401,id: 131,relatedTime: 54301,xposition: 739},
+{imageId: 251,id: 132,relatedTime: 54412,xposition: 425},
+{imageId: 401,id: 133,relatedTime: 54750,xposition: 257},
+{imageId: 401,id: 134,relatedTime: 54902,xposition: 195},
+{imageId: 401,id: 135,relatedTime: 55002,xposition: 777},
+{imageId: 401,id: 136,relatedTime: 40102,xposition: 493},
+{imageId: 401,id: 137,relatedTime: 55482,xposition: 894},
+{imageId: 151,id: 138,relatedTime: 55702,xposition: 196},
+{imageId: 201,id: 139,relatedTime: 55902,xposition: 985},
+{imageId: 401,id: 140,relatedTime: 56344,xposition: 678},
+{imageId: 401,id: 141,relatedTime: 56459,xposition: 261},
+{imageId: 401,id: 142,relatedTime: 56702,xposition: 917},
+{imageId: 351,id: 143,relatedTime: 56925,xposition: 112},
+{imageId: 401,id: 144,relatedTime: 57025,xposition: 785},
+{imageId: 201,id: 145,relatedTime: 57425,xposition: 315},
+{imageId: 401,id: 146,relatedTime: 57559,xposition: 584},
+{imageId: 401,id: 147,relatedTime: 57825,xposition: 777},
+{imageId: 401,id: 149,relatedTime: 58025,xposition: 59},
+{imageId: 201,id: 150,relatedTime: 58125,xposition: 440},
+{imageId: 401,id: 151,relatedTime: 58325,xposition: 790},
+{imageId: 401,id: 152,relatedTime: 58525,xposition: 200},
+{imageId: 401,id: 153,relatedTime: 58925,xposition: 890},
+{imageId: 401,id: 154,relatedTime: 59025,xposition: 589},
+{imageId: 401,id: 155,relatedTime: 59125,xposition: 124},
+{imageId: 301,id: 156,relatedTime: 59325,xposition: 906},
+]
+// //计算总分
+// var num = 0
+// for(var i=0;i<list.length;i++){
+//   switch(list[i].imageId){
+//     case 401:
+//       num += 10;
+//       break;
+//     case 151:
+//       num += 15;
+//       break;
+//     case 201:
+//       num+=20;
+//       break;
+//     case 251:
+//       num += 25;
+//       break;
+//     case 301:
+//       num+=30;
+//       break;
+//     case 351:
+//       num += 35;
+//       break;
+//     case 401:
+//       num += 40;
+//       break;
+//     default :
+//       // console.log(list[i].imageId,list[i].id)
+//   }
+// }
+// console.log(num,list.length)
