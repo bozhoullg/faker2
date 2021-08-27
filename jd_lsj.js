@@ -89,14 +89,7 @@ if ($.isNode()) {
   })
 async function star() {
 await gettoken()
-$.log("开始入会任务")
-await dojoinMember(1000101562)
-await $.wait(3000)
-await dojoinMember(1000077335)
-await $.wait(3000)
-await dojoinMember(1000008814)
-await $.wait(3000)
-await dojoinMember(1000014803)
+
 $.log("开始领取首页水滴")
 await dotree(1)
 await $.wait(3000)
